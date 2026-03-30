@@ -551,9 +551,9 @@ class GatedLinear(nn.Module):
 
         def _gate_mlp(out_dim: int) -> nn.Sequential:
             return nn.Sequential(
-                CastedLinear(layer_emb_dim, 16, bias=False),
+                CastedLinear(layer_emb_dim, 8, bias=False),
                 nn.ReLU(),
-                CastedLinear(16, out_dim, bias=False),
+                CastedLinear(8, out_dim, bias=False),
             )
 
         self.gate_in  = _gate_mlp(dim_in)  if gate_in  else None
@@ -687,8 +687,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int, num_layers: int, layer_emb_dim: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = GatedLinear(dim, hidden, layer_emb_dim, num_layers, gate_in=False, gate_out=True)
-        self.proj = GatedLinear(hidden, dim, layer_emb_dim, num_layers, gate_in=True, gate_out=False)
+        self.fc = GatedLinear(dim, hidden, layer_emb_dim, num_layers, gate_in=True, gate_out=False)
+        self.proj = GatedLinear(hidden, dim, layer_emb_dim, num_layers, gate_in=False, gate_out=False)
         self.proj.linear._zero_init = True
 
     def forward(self, x: Tensor, layer_idx: int) -> Tensor:
@@ -752,7 +752,9 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.block = Block(model_dim,num_heads,num_kv_heads, mlp_mult,rope_base, qk_gain_init, num_layers, layer_emb_dim)
+        block = [Block(model_dim,num_heads,num_kv_heads, mlp_mult,rope_base, qk_gain_init, self.num_encoder_layers, layer_emb_dim),
+                 Block(model_dim,num_heads,num_kv_heads, mlp_mult,rope_base, qk_gain_init, self.num_decoder_layers, layer_emb_dim)]
+        self.block = nn.ModuleList(block)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -774,12 +776,12 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.block(x, x0, i)
+            x = self.block[0](x, x0, i)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.block(x, x0, self.num_encoder_layers + i)
+            x = self.block[1](x, x0, i)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -905,7 +907,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        layer_emb_dim=32,
+        layer_emb_dim=8,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -919,7 +921,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.block.named_parameters())
+    block_named_params = list(base_model.block[0].named_parameters()) + list(base_model.block[1].named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
