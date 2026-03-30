@@ -1,30 +1,8 @@
 """
-train_gpt_combined.py — combines three depth-conditioning mechanisms on a single
-shared transformer block (ODE / Euler integration, dt = 1 / num_layers):
+Weight-shared ODE-style GPT with hypernetwork weight generation, bigram hashing,
+smear gate, XSA, and optional EMA/QAT.
 
-  1. LayerRotary  — parameter-free geometric differentiation.
-     Before each ODE step the full hidden state x is rotated by a layer-indexed
-     RoPE rotation (same log-spaced frequencies as sequence RoPE, but indexed by
-     depth).  The shared block sees a different orientation of x at every layer.
-
-  2. TemporalRMSNorm  — time-conditioned normalisation.
-     Each pre-norm is a standard RMSNorm followed by a FiLM affine:
-         y = RMSNorm(x) * (1 + γ(t)) + β(t)
-     γ and β are linear projections of a shared hidden state h = silu(t_proj(t_emb)).
-
-  3. Time-dependent output gates  — replaces the fixed attn_scale / mlp_scale.
-     Instead of a static per-channel scalar, the output of each sub-layer is
-     multiplied by  (1 + gate(h)),  where gate is a linear projection of the
-     same shared h.  This lets the block learn to suppress or amplify attention
-     vs MLP contributions differently at each ODE step.
-
-All three conditioning signals share one t_proj MLP per block per step, so the
-extra overhead is a single (t_emb_dim → t_hidden_dim) linear pass.
-
-Everything else — Muon, distributed training, BPB evaluation, int8+zlib
-serialisation, U-Net skip connections — is unchanged from train_gpt.py.
-
-Hard stop: ≤ 1500 lines.
+Based on the modded-nanogpt baseline train_gpt.py.
 """
 
 from __future__ import annotations
@@ -50,12 +28,20 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Optional: flash_attn_interface for FA3.  Fall back to PyTorch SDPA if missing.
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    HAS_FLASH_ATTN_3 = True
+except ImportError:
+    HAS_FLASH_ATTN_3 = False
+
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
 # Default combined run:
-# - 1 shared DiffeqBlock applied 9 times (Euler ODE, dt = 1/9)
-# - Depth symmetry broken by: LayerRotary + TemporalRMSNorm + time-gated output scales
+# - 1 shared Block applied 9 times via hypernetwork-generated weights
+# - Depth symmetry broken by: per-layer embeddings → weight generators + per-layer scales
 # - 8 attention heads, 4 KV heads (GQA), relu² MLP, tied embeddings, vocab 1024
 
 class Hyperparameters:
@@ -81,14 +67,6 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Time-conditioning hypers (used by SinusoidalTimeEmb and DiffeqBlock).
-    # sinusoidal_dim: half-dimension of the sinusoidal time embedding;
-    #   the full t_emb vector fed into t_proj has size 2 * sinusoidal_dim.
-    sinusoidal_dim = int(os.environ.get("SINUSOIDAL_DIM", 16))
-    # time_embed_dim: hidden width of the shared t_proj inside DiffeqBlock;
-    #   all TemporalRMSNorm projections and time gates read from this vector.
-    time_embed_dim = int(os.environ.get("TIME_EMBED_DIM", 64))
-
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
@@ -99,6 +77,15 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Additional model params.
+    layer_emb_dim = int(os.environ.get("LAYER_EMB_DIM", 4))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -117,15 +104,10 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -181,7 +163,6 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
@@ -199,13 +180,8 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -238,7 +214,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
@@ -258,9 +233,6 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -310,17 +282,11 @@ def eval_val(
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        # attn_scale / mlp_scale are gone: replaced by time-dependent 2-D gate projections.
-        # q_gain and skip_weights are the remaining control scalars.
         "q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
@@ -353,8 +319,6 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
             if t32.numel()
@@ -365,18 +329,12 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
         q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-    # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -400,8 +358,6 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
@@ -439,13 +395,11 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         s = obj["scales"][name]
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -455,14 +409,13 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
     header = np.fromfile(file, dtype="<i4", count=256)
-    # SHARD HEADER INTS & SHARD_MAGIC
     if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
         raise ValueError(f"Unexpected shard header for {file}")
     num_tokens = int(header[2])
@@ -476,8 +429,6 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
@@ -507,8 +458,6 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -539,10 +488,36 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # fp32 weight storage, cast to x.dtype at matmul time for bf16 compute.
+    _qat: bool = False
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+
+        if self._qat and self.training and w.ndim == 2:
+            with torch.no_grad():
+                w32 = self.weight.float()
+                row_max = w32.abs().amax(dim=1)
+                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+
+            w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
+
+
+def casted_linear(x: Tensor, weight: Tensor, bias: Tensor | None, qat: bool = False, training: bool = True) -> Tensor:
+    w = weight.to(x.dtype)
+
+    if qat and training and w.ndim == 2:
+        with torch.no_grad():
+            w32 = weight.float()
+            row_max = w32.abs().amax(dim=1)
+            scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+            w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+
+        w = w + (w_q - w).detach()
+    b = bias.to(x.dtype) if bias is not None else None
+    return F.linear(x, w, b)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -553,8 +528,11 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, base: float = 10000.0, train_seq_len: int = 1024):
         super().__init__()
+        self.dim = dim
+        self.base = base
+        self.train_seq_len = train_seq_len
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
@@ -568,8 +546,14 @@ class Rotary(nn.Module):
             or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
         ):
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
+            if seq_len > self.train_seq_len:
+                scale = seq_len / self.train_seq_len
+                new_base = self.base * (scale ** (self.dim / (self.dim - 2)))
+                inv_freq = 1.0 / (new_base ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim))
+            else:
+                inv_freq = self.inv_freq.to(device)
+            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+            freqs = torch.outer(t, inv_freq)
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
@@ -577,89 +561,36 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    # Complex-multiplication convention used for q / k in attention.
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
-# -----------------------------
-# DEPTH-CONDITIONING MODULES
-# -----------------------------
-
-class SinusoidalTimeEmb(nn.Module):
-    """
-    Maps a 1-D time value t ∈ (0, 1] to a sinusoidal vector of size 2*half_dim.
-
-    Uses log-spaced frequencies (same scheme as sequence RoPE) so nearby ODE
-    steps produce nearby embeddings.  Registered as a non-persistent buffer so
-    the frequency table moves with the model but is not saved to checkpoints.
-    """
-    def __init__(self, half_dim: int):
-        super().__init__()
-        freqs = torch.exp(
-            -math.log(10000.0) * torch.arange(half_dim, dtype=torch.float32) / half_dim
-        )
-        self.register_buffer("freqs", freqs, persistent=False)
-
-    def forward(self, t: Tensor) -> Tensor:
-        # t: (num_layers,)  →  returns (num_layers, 2*half_dim)
-        args = t.unsqueeze(-1) * self.freqs.to(t)   # (L, half_dim)
-        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+def _xsa_efficient(y: Tensor, v: Tensor) -> Tensor:
+    """Efficient XSA: subtract self-value projection via GQA-aware reshape.
+    y: [B, T, H, D], v: [B, T, Hkv, D]. H must be divisible by Hkv."""
+    B, T, H, D = y.shape
+    Hkv = v.size(-2)
+    group = H // Hkv
+    y_g = y.reshape(B, T, Hkv, group, D)
+    vn = F.normalize(v, dim=-1).unsqueeze(-2)  # [B, T, Hkv, 1, D]
+    proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+    return (y_g - proj).reshape(B, T, H, D)
 
 
-class LayerRotary(nn.Module):
-    """
-    Parameter-free depth-wise rotation of the full hidden state x.
-
-    Applies a block-diagonal 2-D rotation to every consecutive pair of hidden
-    dimensions, using the same log-spaced frequency scheme as sequence RoPE but
-    indexed by *layer* rather than token position.
-    """
-    def __init__(self, dim: int, num_layers: int, base: float = 10000.0):
-        super().__init__()
-        if dim % 2 != 0:
-            raise ValueError("model_dim must be even for LayerRotary")
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        t = torch.arange(num_layers, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)                           # (num_layers, dim//2)
-        self.register_buffer("cos_table", freqs.cos(), persistent=False)
-        self.register_buffer("sin_table", freqs.sin(), persistent=False)
-
-    def forward(self, x: Tensor, layer_idx: int) -> Tensor:
-        # x: (B, T, dim) — layer_idx is a compile-time constant after loop unrolling.
-        cos = self.cos_table[layer_idx].to(dtype=x.dtype)   # (dim//2,)
-        sin = self.sin_table[layer_idx].to(dtype=x.dtype)   # (dim//2,)
-        half = x.size(-1) // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+def _attention_sdpa(q: Tensor, k: Tensor, v: Tensor, num_heads: int, num_kv_heads: int) -> Tensor:
+    """Standard SDPA attention. q/k/v in [B, heads, T, D] layout."""
+    y = F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=None, is_causal=True,
+        enable_gqa=(num_kv_heads != num_heads),
+    )
+    return y  # [B, heads, T, D]
 
 
-class TemporalRMSNorm(nn.Module):
-    """
-    RMSNorm with time-conditioned FiLM (Feature-wise Linear Modulation).
-
-    Takes a pre-computed hidden vector h = silu(t_proj(t_emb)) shared across
-    all temporal modules in DiffeqBlock — one MLP call per ODE step total.
-
-        y = RMSNorm(x) * (1 + scale_proj(h)) + shift_proj(h)
-
-    Both projections are zero-initialised so the module is an identity at the
-    start of training, avoiding instability from random time conditioning.
-    """
-    def __init__(self, dim: int, t_hidden_dim: int, eps: float | None = None):
-        super().__init__()
-        self.eps = eps
-        self.scale_proj = CastedLinear(t_hidden_dim, dim, bias=False)
-        self.shift_proj = CastedLinear(t_hidden_dim, dim, bias=False)
-        nn.init.zeros_(self.scale_proj.weight)
-        nn.init.zeros_(self.shift_proj.weight)
-
-    def forward(self, x: Tensor, h: Tensor) -> Tensor:
-        # x: (B, T, dim) — h: (t_hidden_dim,), broadcast over B and T.
-        scale = 1.0 + self.scale_proj(h)   # (dim,)
-        shift = self.shift_proj(h)          # (dim,)
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps) * scale + shift
+def _attention_flash3(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    """Flash Attention 3. q/k/v expected in [B, T, H, D] layout."""
+    return flash_attn_3_func(q, k, v, causal=True)  # [B, T, H, D]
 
 
 class CausalSelfAttention(nn.Module):
@@ -689,6 +620,7 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_xsa = True
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -701,12 +633,15 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None, is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y = _attention_sdpa(q, k, v, self.num_heads, self.num_kv_heads)
+
+        # XSA: subtract self-value projection
+        if self.use_xsa:
+            y = _xsa_efficient(y.transpose(1, 2), v.transpose(1, 2))
+            y = y.reshape(bsz, seqlen, dim)
+        else:
+            y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+
         return self.proj(y)
 
 
@@ -723,109 +658,169 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class DiffeqBlock(nn.Module):
-    """
-    Single shared block applied at every ODE step.  Returns the *delta* f(t, x).
-    The caller applies:  x = x + DiffeqBlock(x, t_emb, layer_idx) * dt.
-
-    Three depth-conditioning mechanisms work together:
-
-    ① LayerRotary  (zero params)
-        x_rot = rotate(x, layer_idx)
-        The block sees a distinct orientation of x at each depth.
-
-    ② TemporalRMSNorm  (2×2 small projection matrices per norm)
-        h = silu(t_proj(t_emb))           ← ONE shared MLP call per step
-        attn_in = RMSNorm(x_rot) * (1 + γ_a(h)) + β_a(h)
-        mlp_in  = RMSNorm(x_rot) * (1 + γ_m(h)) + β_m(h)
-
-    ③ Time-dependent output gates  (2 projection matrices)
-        attn_scale(t) = 1 + attn_gate(h)   — per-channel, replaces fixed scalar
-        mlp_scale(t)  = 1 + mlp_gate(h)
-
-    delta = attn_scale(t) * attn(attn_in) + mlp_scale(t) * mlp(mlp_in)
-
-    All six projection matrices (scale/shift for two norms + two gates) share
-    the same h, so t_proj runs only once per ODE step regardless of model depth.
-    All projections are zero-initialised → identity behaviour at init.
-    """
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-        num_layers: int,      # needed by LayerRotary
-        t_emb_dim: int,       # = 2 * sinusoidal_dim
-        t_hidden_dim: int,    # = time_embed_dim
-    ):
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
-        # ① Shared time MLP — one forward pass serves all conditioning below.
-        self.t_proj = CastedLinear(t_emb_dim, t_hidden_dim, bias=True)
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
-        # ② Time-conditioned norms.
-        self.attn_norm = TemporalRMSNorm(dim, t_hidden_dim)
-        self.mlp_norm  = TemporalRMSNorm(dim, t_hidden_dim)
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
 
-        # ③ Time-dependent output gates (zero-init → scale = 1 at start).
-        self.attn_gate = CastedLinear(t_hidden_dim, dim, bias=False)
-        self.mlp_gate  = CastedLinear(t_hidden_dim, dim, bias=False)
-        nn.init.zeros_(self.attn_gate.weight)
-        nn.init.zeros_(self.mlp_gate.weight)
 
-        # Static attention and MLP (weights shared across all ODE steps).
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp  = MLP(dim, mlp_mult)
+class BigramHashEmbedding(nn.Module):
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
 
-        # ① Parameter-free depth rotation.
-        self.layer_rotary = LayerRotary(dim, num_layers, base=rope_base)
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
 
-    def forward(self, x: Tensor, t_emb: Tensor, layer_idx: int) -> Tensor:
-        # ── shared time hidden state ──────────────────────────────────────
-        h = F.silu(self.t_proj(t_emb))          # (t_hidden_dim,)
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
 
-        # ── ① depth rotation ─────────────────────────────────────────────
-        x_rot = self.layer_rotary(x, layer_idx)  # (B, T, dim)
 
-        # ── ② time-conditioned norms ──────────────────────────────────────
-        attn_in = self.attn_norm(x_rot, h)       # (B, T, dim)
-        mlp_in  = self.mlp_norm(x_rot, h)        # (B, T, dim)
+class WeightGenerator(nn.Module):
+    """Generates per-layer weight matrices from learned layer embeddings."""
 
-        # ── ③ time-dependent output gates ─────────────────────────────────
-        attn_scale = 1.0 + self.attn_gate(h)     # (dim,)
-        mlp_scale  = 1.0 + self.mlp_gate(h)      # (dim,)
+    def __init__(self, num_layers: int, model_dim: int, layer_emb_dim: int,
+                 num_heads: int, num_kv_heads: int, mlp_mult: int):
+        super().__init__()
+        self.num_layers = num_layers
+        head_dim = model_dim // num_heads
+        kv_dim = num_kv_heads * head_dim
+        hidden = model_dim * mlp_mult
 
-        attn_delta = attn_scale * self.attn(attn_in)   # (B, T, dim)
-        mlp_delta  = mlp_scale  * self.mlp(mlp_in)     # (B, T, dim)
-        return attn_delta + mlp_delta               # ODE delta, not updated x
+        self.layer_emb = nn.Embedding(num_layers, layer_emb_dim)
+
+        # Weight shapes: F.linear uses weight of shape (out_features, in_features)
+        self.w_q_shape = (model_dim, model_dim)       # q_proj: in=dim, out=dim
+        self.w_k_shape = (kv_dim, model_dim)           # k_proj: in=dim, out=kv_dim
+        self.w_v_shape = (kv_dim, model_dim)           # v_proj: in=dim, out=kv_dim
+        self.w_out_shape = (model_dim, model_dim)      # out_proj: in=dim, out=dim
+        self.w_fc_shape = (hidden, model_dim)           # MLP fc: in=dim, out=hidden
+        self.w_proj_shape = (model_dim, hidden)         # MLP proj: in=hidden, out=dim
+
+        mid = layer_emb_dim * 4
+
+        def _make_gen(out_numel: int) -> nn.Sequential:
+            return nn.Sequential(
+                CastedLinear(layer_emb_dim, mid, bias=False),
+                nn.LeakyReLU(0.5),
+                CastedLinear(mid, out_numel, bias=False),
+            )
+
+        self.w_q_gen = _make_gen(self.w_q_shape[0] * self.w_q_shape[1])
+        self.w_k_gen = _make_gen(self.w_k_shape[0] * self.w_k_shape[1])
+        self.w_v_gen = _make_gen(self.w_v_shape[0] * self.w_v_shape[1])
+        self.w_out_gen = _make_gen(self.w_out_shape[0] * self.w_out_shape[1])
+        self.w_fc_gen = _make_gen(self.w_fc_shape[0] * self.w_fc_shape[1])
+        self.w_proj_gen = _make_gen(self.w_proj_shape[0] * self.w_proj_shape[1])
+
+        # Zero-init the last linear in each generator so output starts near identity
+        for gen in [self.w_q_gen, self.w_k_gen, self.w_v_gen,
+                    self.w_out_gen, self.w_fc_gen, self.w_proj_gen]:
+            nn.init.zeros_(gen[-1].weight)
+
+    def forward(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        layer_emb = self.layer_emb.weight  # (num_layers, layer_emb_dim)
+        w_q = self.w_q_gen(layer_emb).reshape(self.num_layers, *self.w_q_shape)
+        w_k = self.w_k_gen(layer_emb).reshape(self.num_layers, *self.w_k_shape)
+        w_v = self.w_v_gen(layer_emb).reshape(self.num_layers, *self.w_v_shape)
+        w_out = self.w_out_gen(layer_emb).reshape(self.num_layers, *self.w_out_shape)
+        w_fc = self.w_fc_gen(layer_emb).reshape(self.num_layers, *self.w_fc_shape)
+        w_proj = self.w_proj_gen(layer_emb).reshape(self.num_layers, *self.w_proj_shape)
+        return w_q, w_k, w_v, w_out, w_fc, w_proj
+
+
+class Block(nn.Module):
+    """A single transformer block that receives its weights externally."""
+
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        self.hidden = dim * mlp_mult
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
+
+    def forward(
+        self, x: Tensor, x0: Tensor,
+        w_q: Tensor, w_k: Tensor, w_v: Tensor, w_out: Tensor,
+        w_fc: Tensor, w_proj: Tensor,
+        attn_scale: Tensor, mlp_scale: Tensor, resid_mix: Tensor,
+        qat: bool = False, use_xsa: bool = False,
+    ) -> Tensor:
+        bsz, seqlen, dim = x.shape
+
+        # Residual mix
+        mix = resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+        # --- Attention ---
+        h = self.attn_norm(x)
+        q = casted_linear(h, w_q, bias=None, qat=qat, training=self.training)
+        k = casted_linear(h, w_k, bias=None, qat=qat, training=self.training)
+        v = casted_linear(h, w_v, bias=None, qat=qat, training=self.training)
+
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+
+        # Use Flash Attention 3 if available, else SDPA
+        if HAS_FLASH_ATTN_3:
+            # FA3 expects [B, T, H, D]
+            y = _attention_flash3(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            )  # [B, T, H, D]
+        else:
+            y = _attention_sdpa(q, k, v, self.num_heads, self.num_kv_heads)
+            y = y.transpose(1, 2)  # → [B, T, H, D]
+
+        if use_xsa:
+            y = _xsa_efficient(y, v.transpose(1, 2))  # both [B, T, H, D]
+
+        y = y.reshape(bsz, seqlen, dim)
+        attn_out = casted_linear(y, w_out, bias=None, qat=qat, training=self.training)
+        x = x + attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
+
+        # --- MLP ---
+        h = self.mlp_norm(x)
+        h = torch.relu(casted_linear(h, w_fc, bias=None, qat=qat, training=self.training))
+        mlp_out = casted_linear(h.square(), w_proj, bias=None, qat=qat, training=self.training)
+        x = x + mlp_scale.to(dtype=mlp_out.dtype)[None, None, :] * mlp_out
+
+        return x
 
 
 class GPT(nn.Module):
-    """
-    Combined DiffeqFormer language model.
-
-    Forward (Euler ODE, num_layers steps, dt = 1/num_layers):
-
-      x = RMSNorm(tok_emb(input_ids))
-
-      # encoder half
-      for i in 0 … num_encoder_layers-1:
-          x = x + DiffeqBlock(x, t_embs[i], i) * dt
-          skips.push(x)
-
-      # decoder half
-      for i in 0 … num_decoder_layers-1:
-          x = x + skip_weights[i] * skips.pop()
-          x = x + DiffeqBlock(x, t_embs[enc+i], enc+i) * dt
-
-      loss = CE( softcap( lm_head( RMSNorm(x) ) ), targets )
-
-    The dt = 1/num_layers factor keeps the gradient magnitude w.r.t. shared
-    block weights comparable to a single independent block, avoiding the N×
-    blow-up that occurs when summing gradients across N shared applications.
-    """
     def __init__(
         self,
         vocab_size: int,
@@ -839,8 +834,11 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        sinusoidal_dim: int,
-        time_embed_dim: int,
+        layer_emb_dim: int = 4,
+        bigram_vocab_size: int = 0,
+        bigram_dim: int = 128,
+        xsa_last_n: int = 0,
+        qat: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -852,32 +850,37 @@ class GPT(nn.Module):
         self.dt = 1.0 / num_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights   = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.qat = qat
+        self.xsa_last_n = xsa_last_n
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.smear = SmearGate(model_dim)
 
-        # Pre-compute sinusoidal time embeddings for all ODE steps; cache as a
-        # non-persistent buffer (deterministic from sinusoidal_dim and num_layers).
-        t_emb_dim = 2 * sinusoidal_dim
-        _time_emb = SinusoidalTimeEmb(sinusoidal_dim)
-        t_vals = torch.arange(1, num_layers + 1, dtype=torch.float32) / num_layers
-        self.register_buffer("time_embeds", _time_emb(t_vals), persistent=False)
-        # time_embeds: (num_layers, 2*sinusoidal_dim) — cast to bf16 in forward.
+        # Hypernetwork weight generator
+        self.w_generator = WeightGenerator(
+            num_layers, model_dim, layer_emb_dim, num_heads, num_kv_heads, mlp_mult
+        )
 
-        # ONE shared DiffeqBlock for all num_layers ODE steps.
-        self.block = DiffeqBlock(
+        # Per-layer scales and residual mix
+        self.attn_scale = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+        resid_mix = torch.stack((torch.ones(model_dim), torch.zeros(model_dim))).float()
+        resid_mix = resid_mix[None, ...].repeat(num_layers, 1, 1)  # (num_layers, 2, model_dim)
+        self.resid_mix = nn.Parameter(resid_mix)
+
+        # Single shared block (weights come from generator)
+        self.block = Block(
             dim=model_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             mlp_mult=mlp_mult,
             rope_base=rope_base,
             qk_gain_init=qk_gain_init,
-            num_layers=num_layers,
-            t_emb_dim=t_emb_dim,
-            t_hidden_dim=time_embed_dim,
         )
 
-        # U-Net skip weights (2-D but semantically a gate, routed to Adam explicitly).
+        # U-Net skip weights
         self.skip_weights = nn.Parameter(
             torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32)
         )
@@ -897,23 +900,48 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        x = self.smear(x)
 
-        # Cast cached time embeddings to current compute dtype (bf16 under autocast).
-        t_embs = self.time_embeds.to(dtype=x.dtype)   # (num_layers, 2*sinusoidal_dim)
+        # Generate all per-layer weights from hypernetwork
+        w_q, w_k, w_v, w_out, w_fc, w_proj = self.w_generator()
 
+        x0 = x
         skips: list[Tensor] = []
 
-        # ── encoder: ODE steps + push U-Net skips ─────────────────────────
+        # Encoder half
         for i in range(self.num_encoder_layers):
-            x = x + self.block(x, t_embs[i], i) * self.dt
+            use_xsa = (self.xsa_last_n > 0) and (i >= self.num_layers - self.xsa_last_n)
+            x = self.block(
+                x, x0,
+                w_q[i], w_k[i], w_v[i], w_out[i], w_fc[i], w_proj[i],
+                attn_scale=self.attn_scale[i],
+                mlp_scale=self.mlp_scale[i],
+                resid_mix=self.resid_mix[i],
+                qat=self.qat,
+                use_xsa=use_xsa,
+            )
             skips.append(x)
 
-        # ── decoder: pop skips, continue ODE ──────────────────────────────
-        for i in range(self.num_decoder_layers):
+        # Decoder half with U-Net skip connections
+        for j in range(self.num_decoder_layers):
+            i = self.num_encoder_layers + j
+            use_xsa = (self.xsa_last_n > 0) and (i >= self.num_layers - self.xsa_last_n)
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = x + self.block(x, t_embs[self.num_encoder_layers + i], self.num_encoder_layers + i) * self.dt
+                skip_idx = len(skips) - 1  # pop from end
+                x = x + self.skip_weights[min(j, self.num_skip_weights - 1)].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.block(
+                x, x0,
+                w_q[i], w_k[i], w_v[i], w_out[i], w_fc[i], w_proj[i],
+                attn_scale=self.attn_scale[i],
+                mlp_scale=self.mlp_scale[i],
+                resid_mix=self.resid_mix[i],
+                qat=self.qat,
+                use_xsa=use_xsa,
+            )
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -964,7 +992,8 @@ def main() -> None:
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    from torch.backends.cuda import (enable_cudnn_sdp, enable_flash_sdp,
+                                     enable_math_sdp, enable_mem_efficient_sdp)
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
@@ -1038,8 +1067,11 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        sinusoidal_dim=args.sinusoidal_dim,
-        time_embed_dim=args.time_embed_dim,
+        layer_emb_dim=args.layer_emb_dim,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+        xsa_last_n=args.xsa_last_n,
+        qat=args.qat_enabled,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1051,24 +1083,39 @@ def main() -> None:
     # Optimizer split:
     # - token embedding → Adam (EMBED_LR / TIED_EMBED_LR)
     # - untied lm_head  → Adam (HEAD_LR)
-    # - 2-D weight matrices in the shared DiffeqBlock → Muon (MATRIX_LR)
-    #     includes: t_proj, TemporalRMSNorm projections, attn_gate, mlp_gate,
-    #               attention (c_q/c_k/c_v/proj) and MLP (fc/proj) weights.
-    # - 1-D params and control params (q_gain) → Adam (SCALAR_LR)
-    # - skip_weights (2-D gate, not an attn matrix) → Adam scalar explicitly
+    # - 2-D weight matrices in block + weight generator → Muon (MATRIX_LR)
+    # - 1-D params and control params → Adam (SCALAR_LR)
+    # - skip_weights (2-D gate) → Adam scalar explicitly
+
+    # Collect matrix params from the shared block and weight generator
     block_named_params = list(base_model.block.named_parameters())
+    wgen_named_params = list(base_model.w_generator.named_parameters())
+    all_block_params = block_named_params + wgen_named_params
+
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in all_block_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in all_block_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    # Add per-layer scales and resid_mix to scalar optimizer
+    scalar_params.extend([base_model.attn_scale, base_model.mlp_scale, base_model.resid_mix])
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # Add smear gate
+    scalar_params.extend(list(base_model.smear.parameters()))
+    # Add bigram params if present
+    if base_model.bigram is not None:
+        for name, p in base_model.bigram.named_parameters():
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                matrix_params.append(p)
+            else:
+                scalar_params.append(p)
+
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1106,13 +1153,9 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"ode:euler shared_block:1 num_layers:{args.num_layers} dt:{base_model.dt:.4f} "
-        f"encoder_layers:{base_model.num_encoder_layers} decoder_layers:{base_model.num_decoder_layers}"
-    )
-    log0(
-        f"conditioning: layer_rotary(rope_base={args.rope_base}) "
-        f"+ temporal_rms_norm + time_gates "
-        f"sinusoidal_dim:{args.sinusoidal_dim} time_embed_dim:{args.time_embed_dim}"
+        f"shared_block:1 num_layers:{args.num_layers} "
+        f"encoder_layers:{base_model.num_encoder_layers} decoder_layers:{base_model.num_decoder_layers} "
+        f"layer_emb_dim:{args.layer_emb_dim}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -1123,6 +1166,11 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"bigram_vocab_size:{args.bigram_vocab_size} bigram_dim:{args.bigram_dim} "
+        f"xsa_last_n:{args.xsa_last_n} qat_enabled:{args.qat_enabled} "
+        f"ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1180,6 +1228,11 @@ def main() -> None:
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
+
+    # EMA state
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_enabled:
+        ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1250,6 +1303,13 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # EMA update
+        if ema_state is not None:
+            decay = args.ema_decay
+            with torch.no_grad():
+                for name, param in base_model.state_dict().items():
+                    ema_state[name].mul_(decay).add_(param.float(), alpha=1.0 - decay)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1277,10 +1337,16 @@ def main() -> None:
     )
 
     # -----------------------------
+    # APPLY EMA WEIGHTS BEFORE SERIALIZATION
+    # -----------------------------
+    if ema_state is not None:
+        log0("Applying EMA weights for final evaluation and serialization")
+        ema_sd = {name: t.to(dtype=base_model.state_dict()[name].dtype) for name, t in ema_state.items()}
+        base_model.load_state_dict(ema_sd, strict=True)
+
+    # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
