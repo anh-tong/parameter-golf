@@ -734,6 +734,35 @@ class SharedBlock(nn.Module):
             self.mlp_norm(x), gate_fc
         )
         return x
+    
+class LayerDependentParams(nn.Module):
+    
+    def __init__(self, num_layers: int, model_dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, qk_gain_init: float):
+        super().__init__()
+        head_dim = model_dim // num_heads
+        kv_dim   = num_kv_heads * head_dim
+        hidden   = mlp_mult * model_dim
+
+        # Per-layer gate logits — raw (pre-sigmoid) scalars learned by Adam.
+        # Initialized to 0 so sigmoid(0)=0.5, giving ~topk_percentage active
+        # channels at the start of training after soft_topk thresholding.
+        self.gate_q         = nn.Parameter(torch.zeros(num_layers, model_dim, dtype=torch.float32))
+        self.gate_k         = nn.Parameter(torch.zeros(num_layers, kv_dim,    dtype=torch.float32))
+        self.gate_v         = nn.Parameter(torch.zeros(num_layers, kv_dim,    dtype=torch.float32))
+        self.gate_proj      = nn.Parameter(torch.zeros(num_layers, model_dim, dtype=torch.float32))
+        self.gate_fc        = nn.Parameter(torch.zeros(num_layers, hidden,    dtype=torch.float32))
+
+        self.q_gain = nn.Parameter(
+            torch.full((num_layers, num_heads), qk_gain_init, dtype=torch.float32)
+        )
+
+        # Per-layer residual scalars — not gated, same role as baseline
+        self.attn_scale = nn.Parameter(torch.ones( num_layers, model_dim, dtype=torch.float32))
+        self.mlp_scale  = nn.Parameter(torch.ones( num_layers, model_dim, dtype=torch.float32))
+        self.resid_mix  = nn.Parameter(
+            torch.stack([torch.ones(model_dim), torch.zeros(model_dim)], dim=0)
+            .unsqueeze(0).expand(num_layers, -1, -1).clone().float()
+        )  # [num_layers, 2, model_dim]
 
 
 class GPT(nn.Module):
@@ -781,30 +810,14 @@ class GPT(nn.Module):
             for _ in range(num_shared_blocks)
         ])
 
-        head_dim = model_dim // num_heads
-        kv_dim   = num_kv_heads * head_dim
-        hidden   = mlp_mult * model_dim
-
-        # Per-layer gate logits — raw (pre-sigmoid) scalars learned by Adam.
-        # Initialized to 0 so sigmoid(0)=0.5, giving ~topk_percentage active
-        # channels at the start of training after soft_topk thresholding.
-        self.gate_q         = nn.Parameter(torch.zeros(num_layers, model_dim, dtype=torch.float32))
-        self.gate_k         = nn.Parameter(torch.zeros(num_layers, kv_dim,    dtype=torch.float32))
-        self.gate_v         = nn.Parameter(torch.zeros(num_layers, kv_dim,    dtype=torch.float32))
-        self.gate_proj      = nn.Parameter(torch.zeros(num_layers, model_dim, dtype=torch.float32))
-        self.gate_fc        = nn.Parameter(torch.zeros(num_layers, hidden,    dtype=torch.float32))
-
-        self.q_gain = nn.Parameter(
-            torch.full((num_layers, num_heads), qk_gain_init, dtype=torch.float32)
+        self.layer_dependent_params = LayerDependentParams(
+            num_layers=num_layers,
+            model_dim=model_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            mlp_mult=mlp_mult,
+            qk_gain_init=qk_gain_init,
         )
-
-        # Per-layer residual scalars — not gated, same role as baseline
-        self.attn_scale = nn.Parameter(torch.ones( num_layers, model_dim, dtype=torch.float32))
-        self.mlp_scale  = nn.Parameter(torch.ones( num_layers, model_dim, dtype=torch.float32))
-        self.resid_mix  = nn.Parameter(
-            torch.stack([torch.ones(model_dim), torch.zeros(model_dim)], dim=0)
-            .unsqueeze(0).expand(num_layers, -1, -1).clone().float()
-        )  # [num_layers, 2, model_dim]
 
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -842,21 +855,21 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         # Compute all per-layer gates once, outside the loop — shape [num_layers, d]
-        gate_q    = self.soft_topk(self.gate_q)
-        gate_k    = self.soft_topk(self.gate_k)
-        gate_v    = self.soft_topk(self.gate_v)
-        gate_proj = self.soft_topk(self.gate_proj)
-        gate_fc   = self.soft_topk(self.gate_fc)
+        gate_q    = self.soft_topk(self.layer_dependent_params.gate_q)
+        gate_k    = self.soft_topk(self.layer_dependent_params.gate_k)
+        gate_v    = self.soft_topk(self.layer_dependent_params.gate_v)
+        gate_proj = self.soft_topk(self.layer_dependent_params.gate_proj)
+        gate_fc   = self.soft_topk(self.layer_dependent_params.gate_fc)
 
         for i in range(self.num_encoder_layers):
             block = self.block[i % self.num_shared_blocks]
             x = block(
                 x, x0,
-                self.resid_mix[i],
-                self.attn_scale[i],  
-                self.mlp_scale[i],
+                self.layer_dependent_params.resid_mix[i],
+                self.layer_dependent_params.attn_scale[i],  
+                self.layer_dependent_params.mlp_scale[i],
                 gate_q[i], gate_k[i], gate_v[i], gate_proj[i],
-                self.q_gain[i],       
+                self.layer_dependent_params.q_gain[i],       
                 gate_fc[i],           
             )
             skips.append(x)
@@ -868,11 +881,11 @@ class GPT(nn.Module):
             block = self.block[i % self.num_shared_blocks]
             x = block(
                 x, x0,
-                self.resid_mix[i],
-                self.attn_scale[i],   
-                self.mlp_scale[i],
+                self.layer_dependent_params.resid_mix[i],
+                self.layer_dependent_params.attn_scale[i],   
+                self.layer_dependent_params.mlp_scale[i],
                 gate_q[i], gate_k[i], gate_v[i], gate_proj[i],
-                self.q_gain[i],       
+                self.layer_dependent_params.q_gain[i],       
                 gate_fc[i],           
             )
 
@@ -1015,9 +1028,7 @@ def main() -> None:
     # - shared matrix params (Q/K/V/proj/fc/mlp_proj) in enc_block and dec_block → Muon
     # - gate vectors + per-layer scalars (attn_scale, mlp_scale, resid_mix, q_gain,
     #   gate_q/k/v/proj/mlp_proj) → Adam with SCALAR_LR
-    enc_named = list(base_model.enc_block.named_parameters())
-    dec_named = list(base_model.dec_block.named_parameters())
-    block_named_params = enc_named + dec_named
+    block_named_params = list(base_model.block.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1028,6 +1039,11 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    
+    # add to scalar_params the layer dependent params (gates and scales)
+    layer_dep_named_params = list(base_model.layer_dependent_params.parameters())
+    scalar_params += layer_dep_named_params
+    
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
